@@ -10,7 +10,7 @@ plt.figure(figsize=(12, 8))
 
 # --- Parameters ---
 fs = 44100          # Sampling rate (Hz), standard for many waveforms (including CDs!)
-T = 5               # Duration (seconds)
+T = 60               # Duration (seconds)
 f0 = 10000          # Nominal frequency of the sinusoid (Hz)
 A = 1.0             # Amplitude
 phase_noise_strength = 0.01  # Stddev of phase noise increments per sample (radians)
@@ -40,7 +40,7 @@ scaling = 'density' # Power spectral density scaling
 tau_s = tau / fs
 
 # Calculate psd
-f, psd = pc.welch(wf, fs, tau, hop=hop, win=win, scaling=scaling)
+f, psd = pc.get_welch(wf, fs, tau, hop=hop, win=win, scaling=scaling)
 
 # Convert to log "dB" scale (technically not dB since no reference point)
 psd_log = 10*np.log10(psd)
@@ -76,41 +76,52 @@ ref_type = 'next_seg' # This means we reference the phase to the next segment AK
 # Convert to samples
 xi = round(xi_s * fs)
 
-# Calculate coherence
-f, coh = pc.get_coherence(wf, fs, xi, pw, tau, hop=hop, win_meth=win_meth, ref_type=ref_type)
+# Calculate coherence of waveform with itself
+f, acoh = pc.get_autocoherence(wf, fs, xi, pw, tau, hop=hop, win_meth=win_meth, ref_type=ref_type)
 
 # Plot
 plt.subplot(2, 2, 2)
-plt.title("Coherence Spectrum")
-plt.plot(f, coh, label=rf'Coherence ($\xi={xi_s*1000:.1f}$ms)')
+plt.title("Autocoherence Spectrum")
+plt.plot(f, acoh, label=rf'Coherence ($\xi={xi_s*1000:.1f}$ms)')
 # Get the frequency bin of interest and mark it
 f0_idx = np.argmin(np.abs(f-f0))
-plt.scatter(f[f0_idx], coh[f0_idx], color='red')
+plt.scatter(f[f0_idx], acoh[f0_idx], color='red')
 plt.ylim(0, 1)
-plt.ylabel("Coherence")
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("Autocoherence")
 plt.legend()
 
 
 "Get Colossogram"
-# This is a series of coherences, one for each xi value, showing how the coherence falls off with increasing reference distance
+# This is a series of autocoherences, one for each xi value, showing how the coherence falls off with increasing reference distance
 
 # --- Parameters ---
 xis = {
     'xi_min_s' : 0.01,
-    'xi_max_s' : 0.2,
-    'delta_xi_s' : 0.005,
+    'xi_max_s' : 1.0,
+    'delta_xi_s' : 0.01,
 } 
 # the xis parameter can be dict like this to create evenly spaced array from xi_min to xi_max with step delta_xi (can be passed in samples or seconds)
 # ...or it can just be the array of desired xi values (in samples)
 
-# Calculate coherences
-print("Calculating Coherences:")
-xis_s, f, coherences = pc.colossogram_coherences(wf, fs, xis, pw, tau, hop=hop, win_meth=win_meth)
+# Calculate colossogram
+print("Calculating Colossogram:")
+xis_s, f, colossogram = pc.get_colossogram(wf, fs, xis, pw, tau, hop=hop, win_meth=win_meth)
 
 # Plot colossogram
 plt.subplot(2, 2, 3)
-pc.plot_colossogram(xis_s, f, coherences)
-plt.suptitle("Sinusoid with Brownian Phase Noise")
+pc.plot_colossogram(xis_s, f, colossogram)
+plt.ylim(8, 12)
 plt.title(rf"Colossogram ($\tau={tau_s:.3f}$s, $\rho={rho}$)")
+
+# Extract N_xi
+N_xi, fit_dict = pc.get_N_xi(xis_s, f, colossogram, f0)
+
+plt.subplot(2, 2, 4)
+pc.plot_N_xi_fit(fit_dict)
+
+
+# Wrap it up
+plt.suptitle("Sinusoid with Brownian Phase Noise")
 plt.tight_layout()
 plt.show()

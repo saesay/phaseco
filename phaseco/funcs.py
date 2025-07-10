@@ -3,10 +3,10 @@ from typing import Union, Tuple, Optional
 from numpy.typing import NDArray
 from numpy import floating, complexfloating
 from phaseco.helper_funcs import *
-from scipy.signal import get_window
+from scipy.signal import get_window, find_peaks
 from scipy.fft import rfft, rfftfreq, fftshift
+from scipy.optimize import curve_fit
 from tqdm import tqdm
-import phaseco as pc
 
 
 """
@@ -189,7 +189,7 @@ def get_stft(
         return t, f, stft
 
 
-def get_coherence(
+def get_autocoherence(
     wf,
     fs,
     xi,
@@ -394,7 +394,7 @@ def get_coherence(
         phase_diffs = pd_low
         coherence_low, avg_pd = get_avg_vector(pd_low)
         coherence_high, _ = get_avg_vector(pd_high)
-        # average the coherences you would get from either of these
+        # average the colossogram you would get from either of these
         coherence = (coherence_low + coherence_high) / 2
 
     else:
@@ -531,7 +531,7 @@ def get_win_pc(win_meth, tau, xi, ref_type="next_seg"):
     )  # Note that unless explicitly changed via eta windowing, tau just passes through
 
 
-def colossogram_coherences(
+def get_colossogram(
     wf,
     fs,
     xis,
@@ -545,7 +545,7 @@ def colossogram_coherences(
     ref_type="next_seg",
     return_dict=False,
 ):
-    """Gets the phase coherence of the waveform against a copy of the waveform advanced xi samples
+    """Gets the phase coherence of the waveform against a copy of the waveform advanced xi samples for an array of xi values to track how this coherence falls off at larger reference distances
 
     Parameters
     ------------
@@ -575,15 +575,15 @@ def colossogram_coherences(
         Either "next_seg" to ref phase against next window or "next_freq" for next frequency bin or "both_freqs" to compare freq bin on either side
     return_dict: bool, optional
         Defaults to only returning (xis_s, f, coherence); but if this is enabled, then a dictionary is returned with keys:
-        'xis', 'xis_s', 'f', 'coherences', 'tau', 'fs', 'N_pd_min', 'N_pd_max', 'hop', 'win_meth', 'global_xi_max'
+        'xis', 'xis_s', 'f', 'colossogram', 'tau', 'fs', 'N_pd_min', 'N_pd_max', 'hop', 'win_meth', 'global_xi_max'
     Returns
     -------
     xis_s : numpy.ndarray
         array of xi values in units of seconds
     f : numpy.ndarray
         frequency axis
-    coherences : numpy.ndarray
-        phase coherences with dimensions (xi, freq)
+    colossogram : numpy.ndarray
+        phase colossogram with dimensions (xi, freq)
     """
 
     # Handle defaults
@@ -598,8 +598,8 @@ def colossogram_coherences(
     # Get frequency array
     f = np.array(rfftfreq(tau, 1 / fs))
     N_bins = len(f)
-    # Initialize coherences array
-    coherences = np.zeros((len(xis), N_bins))
+    # Initialize colossogram array
+    colossogram = np.zeros((len(xis), N_bins))
 
     "Calculate min/max N_pd"
     # Set the max xi that will determine this minimum number of phase diffs
@@ -628,14 +628,14 @@ def colossogram_coherences(
         # Even though the *potential* N_pd_max is bigger, we just use N_pd_min all the way so this is also the max
         N_pd_max = N_pd_min  # This way we can return both a min and a max regardless, even if they are equal
 
-    # Loop through xis and calculate coherences
+    # Loop through xis and calculate colossogram
     for i, xi in enumerate(tqdm(xis)):
         # Calculate N_pd (assuming we're not holding it constant, in which case it was already done outside of loop)
         if not const_N_pd:
             # This is just as many segments as we possibly can with the current xi reference
             eff_len = len(wf) - xi
             N_pd = int((eff_len - tau) / hop) + 1
-        get_coherence_result = get_coherence(
+        get_coherence_result = get_autocoherence(
             wf=wf,
             fs=fs,
             tau=tau,
@@ -648,30 +648,34 @@ def colossogram_coherences(
             ref_type=ref_type,
         )
         assert isinstance(get_coherence_result, tuple)  # CTC
-        coherences[i, :] = get_coherence_result[1]
+        colossogram[i, :] = get_coherence_result[1]
 
-    # Convert to xis_s
+    # Convert to seconds to add to dict
     xis_s = xis / fs
+    hop_s = hop / fs
+    tau_s = tau / fs
 
     if return_dict:
         return {
             "xis": xis,
             "xis_s": xis_s,
             "f": f,
-            "coherences": coherences,
+            "colossogram": colossogram,
             "tau": tau,
+            "tau_s": tau_s,
             "fs": fs,
             "N_pd_min": N_pd_min,
             "N_pd_max": N_pd_max,
             "hop": hop,
+            "hop_s": hop_s,
             "win_meth": win_meth,
             "global_xi_max": global_xi_max,
         }
     else:
-        return xis_s, f, coherences
+        return xis_s, f, colossogram
 
 
-def welch(
+def get_welch(
     wf,
     fs,
     tau,
@@ -774,3 +778,151 @@ def welch(
         return {"f": f, "spectrum": spectrum, "segmented_spectrum": segmented_spectrum}
     else:
         return f, spectrum
+def get_N_xi(xis_s, f, colossogram, f0, decay_start_limit_xi_s=None, sigma_power=0, start_peak_prominence=0.01, A0=1, T0=0.5, A_max=np.inf, noise_floor_bw_factor=1):
+    # Handle default; if none is passed, we'll assume the decay start is within the first 25% of the xis array
+    if decay_start_limit_xi_s is None:
+        decay_start_limit_xi_s = xis_s[len(xis_s) // 4]
+    f0_idx = np.argmin(
+        np.abs(f - f0)
+    )  # Get index corresponding to your desired f0 estimate
+    f0_exact = f[f0_idx]  # Get true f0 target frequency bin center
+    colossogram_slice = colossogram[:, f0_idx]  # Get colossogram slice
+    # Calculate sigma weights in fits; bigger sigma = less sure about this point
+    # So sigma_power <= -1 means weight the low coherence bins less and focus on the initial decay more
+    sigma = None if sigma_power == 0 else colossogram_slice**sigma_power
+
+    # Calculate noise floor and when we've dipped below it
+    is_noise, noise_means, noise_stds = get_is_noise(
+        colossogram,
+        colossogram_slice,
+        noise_floor_bw_factor=noise_floor_bw_factor,
+    )
+
+    # Find where to start the fit as the latest peak in the range defined by xi=[0, decay_start_max_xi]
+    decay_start_max_xi_idx = np.argmin(np.abs(xis_s - decay_start_limit_xi_s))
+    maxima = find_peaks(colossogram_slice[:decay_start_max_xi_idx], prominence=start_peak_prominence)[0]
+    num_maxima = len(maxima)
+    match num_maxima:
+        case 1:
+            print(
+                f"One peak found in first {decay_start_limit_xi_s*1000:.0f}ms of xi, starting fit here"
+            )
+            decay_start_idx = maxima[0]
+        case 2:
+            print(
+                f"Two peaks found in first {decay_start_limit_xi_s*1000:.0f}ms of xi, starting fit at second one!"
+            )
+            decay_start_idx = maxima[1]
+        case 0:
+            print(
+                f"No peaks found in first {decay_start_limit_xi_s*1000:.0f}ms of xi, starting fit at first xi!"
+            )
+            decay_start_idx = 0
+        case _:
+            print(
+                f"Three or more peaks found in first {decay_start_limit_xi_s*1000:.0f}ms of xi, starting fit at last one!"
+            )
+            decay_start_idx = maxima[-1]
+
+    # Find first time there is a dip below the noise floor
+    decayed_idx = np.argmax(is_noise[decay_start_idx:]) # Returns index of the first maximum in the array e.g. the first 1
+    # If there are no 1s in the array -- aka EVERYTHING is noise -- it just returns 0
+    if decayed_idx == 0:
+        print(f"Signal at {f0_exact:.0f}Hz never decays!")
+        # In this case, we want to fit out to the very end
+        decayed_idx = -1 
+    
+    decayed_idx = decayed_idx + decay_start_idx # account for the fact that our is_noise array was (temporarily) cropped
+
+    # Curve Fit
+    print(
+        f"Fitting exp decay to {f0_exact:.0f}Hz peak"
+    )
+    # Crop arrays to the fit range
+    xis_s_fit_crop = xis_s[decay_start_idx:decayed_idx]
+    cgram_slice_fit_crop = colossogram_slice[decay_start_idx:decayed_idx]
+    # Initialize fitting vars
+    failures = 0
+    popt = None
+    trim_step = 1
+    # Set initial guesses and bounds
+    p0 = [T0, A0]
+    bounds = ([0, 0], [np.inf, A_max])
+
+    while len(xis_s_fit_crop) > trim_step and popt is None:
+        try:
+            popt, pcov = curve_fit(
+                exp_decay,
+                xis_s_fit_crop,
+                cgram_slice_fit_crop,
+                p0=p0,
+                sigma=sigma,
+                bounds=bounds,
+            )
+            break  # Fit succeeded!
+        except (RuntimeError, ValueError) as e:
+            # Trim the x, y,
+            failures += 1
+            xis_s_fit_crop = xis_s_fit_crop[trim_step:-trim_step]
+            cgram_slice_fit_crop = cgram_slice_fit_crop[trim_step:-trim_step]
+            sigma = sigma[trim_step:-trim_step]
+
+            print(
+                f"Fit failed (attempt {failures}): — trimmed to {len(xis_s_fit_crop)} points"
+            )
+
+    # HAndle case where curve fit fails
+    if popt is None:
+        print(f"Curve fit failed after all attempts ({f0_exact:.0f}Hz)")
+        T, T_std, A, A_std, mse, xis_s_fit_crop, fitted_exp_decay = (
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+            -1,
+        )
+        # raise RuntimeError(f"Curve fit failed after all attempts ({freq:.0f}Hz from {wf_fn})")
+    else:
+        # If successful, get the paramters and standard deviation
+        perr = np.sqrt(np.diag(pcov))
+        T = popt[0]
+        T_std = perr[0]
+        A = popt[1]
+        A_std = perr[1]
+        # Get the fitted exponential decay
+        fitted_exp_decay = exp_decay(xis_s_fit_crop, *popt)
+
+        # Calculate MSE
+        mse = np.mean((fitted_exp_decay - cgram_slice_fit_crop) ** 2)
+    
+    # Calculate xis in num cycles
+    xis_num_cycles = xis_s * f0_exact
+    N_xi = T * f0_exact
+    N_xi_std = T_std * f0_exact
+    xis_num_cycles_fit_crop = xis_s_fit_crop * f0_exact
+
+    return N_xi, {
+        "f": f,
+        "f0_exact": f0_exact,
+        "colossogram_slice": colossogram_slice,
+        "N_xi": N_xi,
+        "N_xi_std": N_xi_std,
+        "T": T,
+        "T_std": T_std,
+        "A": A,
+        "A_std": A_std,
+        "mse": mse,
+        "is_noise": is_noise,
+        "decay_start_idx": decay_start_idx,
+        "decayed_idx": decayed_idx,
+        "xis_s": xis_s,
+        "xis_s_fit_crop": xis_s_fit_crop,
+        "xis_num_cycles_fit_crop": xis_num_cycles_fit_crop,
+        "xis_num_cycles": xis_num_cycles,
+        "fitted_exp_decay": fitted_exp_decay,
+        "noise_means": noise_means,
+        "noise_stds": noise_stds,
+        'noise_floor_bw_factor':noise_floor_bw_factor,
+    }
